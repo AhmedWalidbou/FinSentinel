@@ -1,11 +1,21 @@
-import time
-import numpy as np
+"""
+Prometheus metrics - FinSentinel M3 monitoring.
+
+Owns every metric definition and the PSI drift computation. This is a
+pure module: it is imported by the FastAPI app (src/api/main.py), which
+calls track_prediction() on each inference and exposes the registry on
+/metrics. It deliberately has no __main__ block - a monitoring module
+that generates its own synthetic predictions would report metrics that
+say nothing about real traffic.
+"""
+
 from collections import deque
-from prometheus_client import Counter, Histogram, Gauge, Summary, start_http_server
 from typing import Optional
 
+import numpy as np
+from prometheus_client import Counter, Gauge, Histogram, Summary, start_http_server
 
-# ─── Prediction metrics ───────────────────────────────────────────────────────
+# --- Prediction metrics ---
 
 PREDICTION_COUNTER = Counter(
     "finsentinel_predictions_total",
@@ -29,7 +39,7 @@ CONFIDENCE_SUMMARY = Summary(
     "Prediction confidence score distribution"
 )
 
-# ─── Sentiment distribution ───────────────────────────────────────────────────
+# --- Sentiment distribution ---
 
 SENTIMENT_COUNTER = Counter(
     "finsentinel_sentiment_total",
@@ -43,7 +53,7 @@ SENTIMENT_RATIO = Gauge(
     ["label"]
 )
 
-# ─── Model info ───────────────────────────────────────────────────────────────
+# --- Model info ---
 
 MODEL_ACCURACY = Gauge(
     "finsentinel_model_accuracy",
@@ -61,7 +71,7 @@ MODEL_INFO = Gauge(
     ["model_name", "base_model", "version"]
 )
 
-# ─── API metrics ──────────────────────────────────────────────────────────────
+# --- API metrics ---
 
 API_REQUESTS_TOTAL = Counter(
     "finsentinel_api_requests_total",
@@ -80,36 +90,41 @@ API_ACTIVE_REQUESTS = Gauge(
     "Number of currently active requests"
 )
 
-# ─── Data drift ───────────────────────────────────────────────────────────────
+# --- Data drift ---
 
 DATA_DRIFT_SCORE = Gauge(
     "finsentinel_data_drift_score",
-    "Data drift score — 0=no drift, 1=full drift"
+    "Population Stability Index between recent and reference distributions"
 )
 
 DATA_DRIFT_ALERT = Gauge(
     "finsentinel_data_drift_alert",
-    "Data drift alert — 1=drift detected, 0=normal"
+    "Data drift alert - 1=drift detected, 0=normal"
 )
 
-DRIFT_THRESHOLD = 0.3
+# Standard PSI reading: < 0.1 no drift, 0.1-0.25 moderate, >= 0.25
+# significant. The alert threshold matches that convention rather than
+# a hand-picked value.
+DRIFT_THRESHOLD = 0.25
+MIN_WINDOW_FOR_DRIFT = 20
 
-
-# ─── Internal state for drift detection ──────────────────────────────────────
+# --- Internal state for drift detection ---
 
 _prediction_window = deque(maxlen=100)
 _label_counts = {"bearish": 0, "bullish": 0, "neutral": 0}
 _total_predictions = 0
 
-# Reference distribution from training data
+# Reference distribution measured on the training set.
 REFERENCE_DISTRIBUTION = {
     "bearish": 0.164,
     "bullish": 0.192,
     "neutral": 0.644
 }
 
+LABELS = ("bearish", "bullish", "neutral")
 
-# ─── Core tracking functions ──────────────────────────────────────────────────
+
+# --- Core tracking functions ---
 
 def track_prediction(
     label: str,
@@ -118,8 +133,8 @@ def track_prediction(
     use_case: str = "general"
 ) -> None:
     """
-    Track a single prediction — updates all relevant metrics.
-    Called from FastAPI /predict endpoint.
+    Track a single prediction - updates all relevant metrics.
+    Called from the FastAPI /predict endpoint after the model call.
     """
     global _total_predictions
 
@@ -138,14 +153,8 @@ def track_prediction(
     _compute_drift()
 
 
-def track_api_request(
-    endpoint: str,
-    method: str,
-    status_code: int
-) -> None:
-    """
-    Track an API request with endpoint, method and status code.
-    """
+def track_api_request(endpoint: str, method: str, status_code: int) -> None:
+    """Track an API request with endpoint, method and status code."""
     API_REQUESTS_TOTAL.labels(
         endpoint=endpoint,
         method=method,
@@ -154,19 +163,12 @@ def track_api_request(
 
 
 def track_api_error(endpoint: str, error_type: str) -> None:
-    """
-    Track an API error.
-    """
-    API_ERRORS_TOTAL.labels(
-        endpoint=endpoint,
-        error_type=error_type
-    ).inc()
+    """Track an API error."""
+    API_ERRORS_TOTAL.labels(endpoint=endpoint, error_type=error_type).inc()
 
 
 def set_active_requests(count: int) -> None:
-    """
-    Set the number of currently active requests.
-    """
+    """Set the number of currently active requests."""
     API_ACTIVE_REQUESTS.set(count)
 
 
@@ -194,44 +196,57 @@ def set_model_info(
     print(f"  F1 Score : {f1_score}")
 
 
-# ─── Internal helpers ─────────────────────────────────────────────────────────
+def reset_state() -> None:
+    """
+    Clear the sliding window and counters. Intended for tests and for
+    controlled drift experiments, never called in normal operation.
+    """
+    global _total_predictions
+    _prediction_window.clear()
+    for key in _label_counts:
+        _label_counts[key] = 0
+    _total_predictions = 0
+
+
+# --- Internal helpers ---
 
 def _update_sentiment_ratios() -> None:
     """
-    Update sentiment ratio gauges based on recent predictions.
-    Uses sliding window of last 100 predictions.
+    Update sentiment ratio gauges from the sliding window of the last
+    100 predictions.
     """
     if not _prediction_window:
         return
 
     total = len(_prediction_window)
-    for label in ["bearish", "bullish", "neutral"]:
-        count = _prediction_window.count(label)
-        ratio = count / total
-        SENTIMENT_RATIO.labels(label=label).set(ratio)
+    for label in LABELS:
+        SENTIMENT_RATIO.labels(label=label).set(
+            _prediction_window.count(label) / total
+        )
 
 
 def _compute_drift() -> None:
     """
-    Compute data drift using Population Stability Index (PSI).
-    Compares current prediction distribution vs reference (training) distribution.
+    Compute data drift using the Population Stability Index (PSI),
+    comparing the current prediction distribution against the reference
+    (training) distribution.
+
     PSI < 0.1  : no drift
     PSI < 0.25 : moderate drift
-    PSI >= 0.25: significant drift
+    PSI >= 0.25: significant drift -> alert
+
+    Below MIN_WINDOW_FOR_DRIFT predictions the index is not computed:
+    on a handful of samples PSI is dominated by sampling noise.
     """
-    if len(_prediction_window) < 20:
+    if len(_prediction_window) < MIN_WINDOW_FOR_DRIFT:
         return
 
     total = len(_prediction_window)
     psi = 0.0
 
-    for label in ["bearish", "bullish", "neutral"]:
-        actual = _prediction_window.count(label) / total
-        expected = REFERENCE_DISTRIBUTION.get(label, 0.01)
-
-        actual = max(actual, 0.0001)
-        expected = max(expected, 0.0001)
-
+    for label in LABELS:
+        actual = max(_prediction_window.count(label) / total, 0.0001)
+        expected = max(REFERENCE_DISTRIBUTION.get(label, 0.01), 0.0001)
         psi += (actual - expected) * np.log(actual / expected)
 
     DATA_DRIFT_SCORE.set(round(psi, 4))
@@ -243,59 +258,14 @@ def _compute_drift() -> None:
         DATA_DRIFT_ALERT.set(0)
 
 
-# ─── Server ───────────────────────────────────────────────────────────────────
+# --- Standalone server (unused when imported by the API) ---
 
 def start_metrics_server(port: int = 8002) -> None:
     """
-    Start Prometheus metrics HTTP server on given port.
-    Default port 8002 to avoid conflict with FastAPI on 8000.
+    Start a standalone Prometheus metrics HTTP server.
+
+    Not used in the containerized stack, where the API exposes /metrics
+    on port 8000 directly. Kept for local debugging.
     """
     start_http_server(port)
     print(f"Prometheus metrics server started on port {port}")
-    print(f"Metrics available at: http://localhost:{port}/metrics")
-
-
-# ─── Test ─────────────────────────────────────────────────────────────────────
-
-if __name__ == "__main__":
-    print("Starting FinSentinel Prometheus metrics server...\n")
-
-    set_model_info(
-        model_name="Walid692/finsentinel-camembert",
-        base_model="camembert-base",
-        accuracy=0.7808,
-        f1_score=0.7759
-    )
-
-    predictions = [
-        ("neutral", 0.8339, 299.66, "general"),
-        ("bullish", 0.9123, 150.12, "finance"),
-        ("bearish", 0.7456, 210.34, "finance"),
-        ("neutral", 0.6789, 180.00, "general"),
-        ("neutral", 0.7234, 195.00, "general"),
-        ("bullish", 0.8567, 160.00, "finance"),
-        ("neutral", 0.9012, 140.00, "general"),
-        ("bearish", 0.6543, 220.00, "finance"),
-        ("neutral", 0.7890, 175.00, "general"),
-        ("bullish", 0.8234, 155.00, "finance"),
-    ]
-
-    for label, score, latency, use_case in predictions:
-        track_prediction(label, score, latency, use_case)
-
-    track_api_request("/predict", "POST", 200)
-    track_api_request("/predict", "POST", 200)
-    track_api_request("/health", "GET", 200)
-    track_api_request("/predict", "POST", 422)
-    track_api_error("/predict", "validation_error")
-
-    start_metrics_server(port=8002)
-
-    print("\nMetrics server running on http://localhost:8002/metrics")
-    print("Press Ctrl+C to stop.\n")
-
-    try:
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        print("\nMetrics server stopped.")
