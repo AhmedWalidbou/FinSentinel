@@ -217,3 +217,9 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 mlflow.db 
+
+# FinSentinel runtime artifacts
+data/prediction_history.json
+mlruns/
+prometheus_data/
+grafana_data/

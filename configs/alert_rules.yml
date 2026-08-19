@@ -1,0 +1,67 @@
+groups:
+  - name: finsentinel_alerts
+    interval: 30s
+    rules:
+
+      - alert: HighPredictionLatency
+        expr: histogram_quantile(0.95, rate(finsentinel_prediction_latency_seconds_bucket[5m])) > 2.0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High prediction latency detected"
+          description: "p95 latency is above 2 seconds for more than 2 minutes."
+
+      - alert: CriticalPredictionLatency
+        expr: histogram_quantile(0.95, rate(finsentinel_prediction_latency_seconds_bucket[5m])) > 5.0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Critical prediction latency"
+          description: "p95 latency is above 5 seconds. Immediate action required."
+
+      - alert: DataDriftDetected
+        expr: finsentinel_data_drift_score > 0.1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Data drift detected"
+          description: "PSI score is {{ $value }}. Model retraining may be needed."
+
+      - alert: CriticalDataDrift
+        expr: finsentinel_data_drift_score > 0.25
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Critical data drift"
+          description: "PSI score is {{ $value }}. Model retraining is required immediately."
+
+      - alert: LowConfidenceScore
+        expr: finsentinel_confidence_score < 0.5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Low model confidence"
+          description: "Last prediction confidence is {{ $value }}. Model may be uncertain."
+
+      - alert: HighErrorRate
+        expr: rate(finsentinel_api_errors_total[5m]) > 0.1
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High API error rate"
+          description: "More than 0.1 errors per second in the last 5 minutes."
+
+      - alert: NoRecentPredictions
+        expr: rate(finsentinel_predictions_total[10m]) == 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "No predictions in the last 10 minutes"
+          description: "The API may be down or not receiving traffic."

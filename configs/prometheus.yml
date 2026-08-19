@@ -1,0 +1,25 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: []
+
+rule_files:
+  - "alert_rules.yml"
+
+scrape_configs:
+  # The API is the single source of application metrics: it owns the
+  # model and calls the monitoring module on every prediction, so what
+  # is scraped here reflects real traffic.
+  - job_name: "finsentinel-api"
+    static_configs:
+      - targets: ["finsentinel-api:8000"]
+    metrics_path: "/metrics"
+    scrape_interval: 10s
+
+  - job_name: "prometheus"
+    static_configs:
+      - targets: ["localhost:9090"]
